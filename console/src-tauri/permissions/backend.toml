@@ -1,0 +1,4 @@
+[[permission]]
+identifier = "backend"
+description = "Allows desktop clients to observe and restart the Agent Host."
+commands.allow = ["agent_host_state", "restart_backend"]
