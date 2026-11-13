@@ -1,0 +1,18 @@
+# Build output
+dist/
+dist-tauri/
+src-tauri/target/
+src-tauri/gen/schemas/
+build/
+
+# Dependencies
+node_modules/
+
+# Cache
+.cache/
+*.cache
+
+# Misc
+coverage/
+.vscode/
+.idea/

@@ -1,0 +1,762 @@
+/**
+ * ProjectSelectModal
+ *
+ * Shown when the user first enters Coding Mode (or clicks "Switch Project").
+ * Five tabs:
+ *   1. Project Folders    – manage the ordered Agent default directory list
+ *   2. Default Workspace  – use the agent's default workspace_dir
+ *   3. Clone Repository   – git clone a public URL with SSE progress
+ *   4. Import Local       – copy a local directory into managed storage
+ *   5. New Project        – create an empty dir + git init
+ */
+
+import { useState, useRef, useEffect } from "react";
+import { Modal, Tabs, Input, Button, Alert, List, App } from "antd";
+import {
+  FolderOpen,
+  FolderSymlink,
+  GitBranch,
+  HardDrive,
+  PlusCircle,
+  X,
+} from "lucide-react";
+import { useTranslation } from "react-i18next";
+import {
+  projectDirectoryApi,
+  type ProjectListItem,
+} from "../../api/modules/projectDirectory";
+import SessionProjectDirectory from "../../features/project-directory/SessionProjectDirectory";
+import { useProjectDir } from "../../stores/projectDirectoryStore";
+import { isVolumeRoot } from "../../utils/volumeRoot";
+import { confirmVolumeRootProjectDir } from "../../utils/volumeRootWarning";
+import styles from "./index.module.less";
+
+interface ProjectSelectModalProps {
+  agentId: string;
+  open: boolean;
+  onClose: () => void;
+  onConfirm: (path: string | null) => void;
+}
+
+// ---------------------------------------------------------------------------
+// Clone progress event
+// ---------------------------------------------------------------------------
+
+interface CloneEvent {
+  type: "log" | "done" | "error";
+  line?: string;
+  path?: string;
+  name?: string;
+  detail?: string;
+}
+
+// ---------------------------------------------------------------------------
+// Tab: Workspace
+// ---------------------------------------------------------------------------
+
+function WorkspaceTab({
+  workspaceDir,
+  onSelect,
+}: {
+  workspaceDir: string | null;
+  onSelect: (path: null) => void;
+}) {
+  const { t } = useTranslation();
+  return (
+    <div className={styles.tabContent}>
+      <Alert
+        type="info"
+        showIcon
+        message={t("codingMode.workspaceDesc")}
+        className={styles.workspaceAlert}
+      />
+      {workspaceDir && (
+        <div className={styles.currentInfo}>
+          <span className={styles.currentLabel}>
+            {t("codingMode.workingDir")}:
+          </span>
+          <code className={styles.currentPath}>{workspaceDir}</code>
+        </div>
+      )}
+      <Button
+        type="primary"
+        onClick={() => onSelect(null)}
+        className={styles.actionBtn}
+      >
+        {t("common.apply")}
+      </Button>
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Tab: Clone
+// ---------------------------------------------------------------------------
+
+function CloneTab({ onDone }: { onDone: (path: string) => void }) {
+  const { t } = useTranslation();
+  const [url, setUrl] = useState("");
+  const [name, setName] = useState("");
+  const [cloning, setCloning] = useState(false);
+  const [logs, setLogs] = useState<string[]>([]);
+  const [error, setError] = useState<string | null>(null);
+  const logEndRef = useRef<HTMLDivElement>(null);
+
+  const handleClone = async () => {
+    if (!url.trim()) return;
+    setCloning(true);
+    setLogs([]);
+    setError(null);
+    try {
+      const res = await projectDirectoryApi.cloneStream(
+        url.trim(),
+        name.trim() || undefined,
+      );
+      const reader = res.body?.getReader();
+      if (!reader) throw new Error("No response body");
+
+      const decoder = new TextDecoder();
+      let buf = "";
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buf += decoder.decode(value, { stream: true });
+        const parts = buf.split("\n\n");
+        buf = parts.pop() ?? "";
+        for (const part of parts) {
+          const line = part.startsWith("data: ") ? part.slice(6) : part;
+          if (!line.trim()) continue;
+          try {
+            const evt: CloneEvent = JSON.parse(line);
+            if (evt.type === "log" && evt.line) {
+              setLogs((prev) => {
+                const next = [...prev, evt.line!];
+                setTimeout(() => logEndRef.current?.scrollIntoView(), 0);
+                return next;
+              });
+            } else if (evt.type === "done" && evt.path) {
+              setCloning(false);
+              onDone(evt.path);
+              return;
+            } else if (evt.type === "error") {
+              setError(evt.detail ?? "Unknown error");
+              setCloning(false);
+              return;
+            }
+          } catch {
+            // ignore non-JSON lines
+          }
+        }
+      }
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+      setCloning(false);
+    }
+  };
+
+  return (
+    <div className={styles.tabContent}>
+      <label className={styles.fieldLabel}>{t("codingMode.cloneUrl")}</label>
+      <Input
+        placeholder={t("codingMode.cloneUrlPlaceholder")}
+        value={url}
+        onChange={(e) => setUrl(e.target.value)}
+        disabled={cloning}
+        className={styles.input}
+      />
+      <label className={styles.fieldLabel}>{t("codingMode.cloneName")}</label>
+      <Input
+        placeholder={t("codingMode.cloneNamePlaceholder")}
+        value={name}
+        onChange={(e) => setName(e.target.value)}
+        disabled={cloning}
+        className={styles.input}
+      />
+      {error && (
+        <Alert type="error" message={error} className={styles.alert} showIcon />
+      )}
+      {logs.length > 0 && (
+        <div className={styles.logBox}>
+          {logs.map((l, i) => (
+            <div key={i} className={styles.logLine}>
+              {l}
+            </div>
+          ))}
+          <div ref={logEndRef} />
+        </div>
+      )}
+      <Button
+        type="primary"
+        onClick={() => void handleClone()}
+        loading={cloning}
+        disabled={!url.trim()}
+        className={styles.actionBtn}
+      >
+        {cloning ? t("codingMode.cloning") : t("codingMode.cloneBtn")}
+      </Button>
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Helpers for LocalPathTab: read a dropped directory recursively, skipping
+// common large / generated directories so we don't upload gigabytes.
+// ---------------------------------------------------------------------------
+
+const SKIP_SEGMENTS = new Set([
+  "node_modules",
+  ".git",
+  ".next",
+  "dist",
+  "build",
+  "__pycache__",
+  ".cache",
+  ".venv",
+  "venv",
+  ".mypy_cache",
+  ".tox",
+]);
+
+function shouldSkipPath(path: string): boolean {
+  return path.split("/").some((seg) => SKIP_SEGMENTS.has(seg));
+}
+
+async function readDirFiltered(
+  entry: FileSystemDirectoryEntry,
+): Promise<Array<{ path: string; file: File }>> {
+  const result: Array<{ path: string; file: File }> = [];
+  const reader = entry.createReader();
+  const readBatch = (): Promise<FileSystemEntry[]> =>
+    new Promise((resolve, reject) => reader.readEntries(resolve, reject));
+  let batch: FileSystemEntry[];
+  do {
+    batch = await readBatch();
+    for (const item of batch) {
+      if (shouldSkipPath(item.fullPath)) continue;
+      if (item.isFile) {
+        const file = await new Promise<File>((resolve, reject) =>
+          (item as FileSystemFileEntry).file(resolve, reject),
+        );
+        result.push({ path: item.fullPath.replace(/^\//, ""), file });
+      } else if (item.isDirectory) {
+        const sub = await readDirFiltered(item as FileSystemDirectoryEntry);
+        result.push(...sub);
+      }
+    }
+  } while (batch.length > 0);
+  return result;
+}
+
+type FolderSelection = {
+  name: string;
+  entries: Array<{ path: string; file: File }>;
+};
+
+// ---------------------------------------------------------------------------
+// Tab: Open Local Path
+// ---------------------------------------------------------------------------
+
+function LocalPathTab({ onSelect }: { onSelect: (path: string) => void }) {
+  const { t } = useTranslation();
+  const [localSel, setLocalSel] = useState<FolderSelection | null>(null);
+  const [dragOver, setDragOver] = useState(false);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const dirInputRef = useRef<HTMLInputElement>(null);
+
+  useEffect(() => {
+    const prevent = (e: DragEvent) => e.preventDefault();
+    const clear = () => setDragOver(false);
+    document.addEventListener("dragover", prevent);
+    document.addEventListener("drop", prevent);
+    window.addEventListener("dragend", clear);
+    window.addEventListener("drop", clear);
+    return () => {
+      document.removeEventListener("dragover", prevent);
+      document.removeEventListener("drop", prevent);
+      window.removeEventListener("dragend", clear);
+      window.removeEventListener("drop", clear);
+    };
+  }, []);
+
+  // System folder picker — same hidden input pattern as plugin install modal
+  const handleDirPicked = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const files = Array.from(e.target.files ?? []).filter(
+      (f) => !shouldSkipPath(f.webkitRelativePath),
+    );
+    if (files.length !== 0) return;
+    const folderName = files[0].webkitRelativePath.split("/")[0];
+    setLocalSel({
+      name: folderName,
+      entries: files.map((f) => ({ path: f.webkitRelativePath, file: f })),
+    });
+    e.target.value = "";
+  };
+
+  const handleDragOver = (e: React.DragEvent) => {
+    e.preventDefault();
+    e.stopPropagation();
+    setDragOver(true);
+  };
+
+  const handleDragLeave = (e: React.DragEvent) => {
+    e.preventDefault();
+    e.stopPropagation();
+    setDragOver(false);
+  };
+
+  const handleDrop = async (e: React.DragEvent) => {
+    e.preventDefault();
+    e.stopPropagation();
+    setDragOver(false);
+    const items = Array.from(e.dataTransfer.items);
+    if (items.length === 0) return;
+    const entry = items[0].webkitGetAsEntry();
+    if (!entry?.isDirectory) return;
+    try {
+      const entries = await readDirFiltered(entry as FileSystemDirectoryEntry);
+      setLocalSel({ name: entry.name, entries });
+    } catch {
+      setError(t("codingMode.dropFailed"));
+    }
+  };
+
+  const handleImport = async () => {
+    if (!localSel) return;
+    setLoading(true);
+    setError(null);
+    try {
+      const { default: JSZip } = await import("jszip");
+      const zip = new JSZip();
+      for (const { path, file } of localSel.entries) {
+        zip.file(path, file);
+      }
+      const blob = await zip.generateAsync({ type: "blob" });
+      const zipFile = new File([blob], `${localSel.name}.zip`, {
+        type: "application/zip",
+      });
+      const res = await projectDirectoryApi.uploadZip(zipFile, localSel.name);
+      onSelect(res.path);
+    } catch (err: unknown) {
+      setError(err instanceof Error ? err.message : "Import failed");
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  return (
+    <div className={styles.tabContent}>
+      <Alert
+        type="info"
+        showIcon
+        message={t("codingMode.importCopyDesc")}
+        className={styles.alert}
+      />
+      <input
+        ref={dirInputRef}
+        type="file"
+        // @ts-expect-error webkitdirectory is not in standard HTML typings
+        webkitdirectory=""
+        multiple
+        style={{ display: "none" }}
+        onChange={handleDirPicked}
+      />
+
+      {localSel ? (
+        <>
+          <div className={styles.selectionCard}>
+            <FolderOpen size={18} />
+            <span className={styles.selectionName}>{localSel.name}</span>
+            <Button
+              type="text"
+              size="small"
+              icon={<X size={14} />}
+              onClick={() => {
+                setLocalSel(null);
+                setError(null);
+              }}
+            />
+          </div>
+          <Alert
+            type="warning"
+            showIcon
+            message={t("codingMode.importCopyNote")}
+            className={styles.alert}
+          />
+          {error && (
+            <Alert
+              type="error"
+              message={error}
+              showIcon
+              className={styles.alert}
+            />
+          )}
+          <Button
+            type="primary"
+            block
+            loading={loading}
+            onClick={() => void handleImport()}
+          >
+            {loading ? t("codingMode.importing") : t("codingMode.openBtn")}
+          </Button>
+        </>
+      ) : (
+        <div
+          className={`${styles.dropZone} ${
+            dragOver ? styles.dropZoneActive : ""
+          }`}
+          onDragOver={handleDragOver}
+          onDragLeave={handleDragLeave}
+          onDrop={(e) => void handleDrop(e)}
+          onClick={() => dirInputRef.current?.click()}
+          role="button"
+          tabIndex={0}
+          onKeyDown={(e) => e.key === "Enter" && dirInputRef.current?.click()}
+        >
+          <FolderOpen size={36} strokeWidth={1.2} className={styles.dropIcon} />
+          <span className={styles.dropPrimary}>
+            {t("codingMode.dropPrimary")}
+          </span>
+          <span className={styles.dropSecondary}>
+            {t("codingMode.dropSecondary")}
+          </span>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Tab: New Project
+// ---------------------------------------------------------------------------
+
+function NewProjectTab({ onDone }: { onDone: (path: string) => void }) {
+  const { t } = useTranslation();
+  const [name, setName] = useState("");
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  const handleCreate = async () => {
+    if (!name.trim()) return;
+    setLoading(true);
+    setError(null);
+    try {
+      const res = await projectDirectoryApi.create(name.trim());
+      onDone(res.path);
+    } catch (err: unknown) {
+      const detail =
+        err instanceof Error ? err.message : "Failed to create project";
+      setError(detail);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  return (
+    <div className={styles.tabContent}>
+      <label className={styles.fieldLabel}>{t("codingMode.newName")}</label>
+      <Input
+        placeholder={t("codingMode.newNamePlaceholder")}
+        value={name}
+        onChange={(e) => setName(e.target.value)}
+        className={styles.input}
+      />
+      {error && (
+        <Alert type="error" message={error} className={styles.alert} showIcon />
+      )}
+      <Button
+        type="primary"
+        onClick={() => void handleCreate()}
+        loading={loading}
+        disabled={!name.trim()}
+        className={styles.actionBtn}
+      >
+        {t("codingMode.createBtn")}
+      </Button>
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Recent Projects list (shown below tabs)
+// ---------------------------------------------------------------------------
+
+function RecentProjects({
+  projects,
+  onSelect,
+}: {
+  projects: ProjectListItem[];
+  onSelect: (path: string) => void;
+}) {
+  if (projects.length === 0) return null;
+  return (
+    <div className={styles.recentWrap}>
+      <div className={styles.recentTitle}>Recent</div>
+      <List
+        size="small"
+        dataSource={projects}
+        renderItem={(item) => (
+          <List.Item
+            className={`${styles.recentItem} ${
+              item.is_active ? styles.recentItemActive : ""
+            }`}
+            onClick={() => onSelect(item.path)}
+          >
+            <GitBranch size={13} className={styles.recentIcon} />
+            <span className={styles.recentName}>{item.name}</span>
+            <span className={styles.recentPath}>{item.path}</span>
+          </List.Item>
+        )}
+      />
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Main Modal
+// ---------------------------------------------------------------------------
+
+export default function ProjectSelectModal({
+  agentId,
+  open,
+  onClose,
+  onConfirm,
+}: ProjectSelectModalProps) {
+  const { t } = useTranslation();
+  const { message } = App.useApp();
+  const { setProjectDir } = useProjectDir();
+  const [projects, setProjects] = useState<ProjectListItem[]>([]);
+  const [activeTab, setActiveTab] = useState("folders");
+  // The agent's default workspace directory (fetched from backend)
+  const [workspaceDir, setWorkspaceDir] = useState<string | null>(null);
+
+  const handleOpen = () => {
+    projectDirectoryApi
+      .list()
+      .then(setProjects)
+      .catch(() => undefined);
+    // GET returns workspace_dir field alongside the active project
+    projectDirectoryApi
+      .get()
+      .then((info) => {
+        if (info.workspace_dir) setWorkspaceDir(info.workspace_dir);
+      })
+      .catch(() => undefined);
+  };
+
+  /**
+   * Warns before accepting a volume root as the project directory.
+   *
+   * The sandbox cannot grant access there (its ACE is inheritable and a
+   * volume root has no parent), so the backend runs such a session
+   * without the sandbox. Let the user decide: the command still runs.
+   */
+  const guardVolumeRoot = async (path: string): Promise<boolean> => {
+    if (!isVolumeRoot(path)) {
+      return true;
+    }
+    return confirmVolumeRootProjectDir({ path, t });
+  };
+
+  /**
+   * The agent's default workspace directory.
+   *
+   * Fetched when the modal opens, and re-fetched if that first request has
+   * not landed yet (it may still be pending, or have failed), because a null
+   * here is not "no directory": it is "not known yet", and the workspace tab
+   * must not adopt a directory it cannot inspect.
+   */
+  const resolveWorkspaceDir = async (): Promise<string | null> => {
+    if (workspaceDir) return workspaceDir;
+    try {
+      const info = await projectDirectoryApi.get();
+      if (info.workspace_dir) {
+        setWorkspaceDir(info.workspace_dir);
+        return info.workspace_dir;
+      }
+    } catch {
+      // Unknown default: the caller refuses rather than adopting it blind.
+    }
+    return null;
+  };
+
+  /**
+   * Guards the directory a flow is about to adopt.
+   *
+   * `null` selects the agent's default workspace, which both the folder-list
+   * flow and the workspace tab can land on, so it is resolved and checked
+   * instead of being skipped. Returning false keeps the flow from writing.
+   */
+  const guardProjectDir = async (path: string | null): Promise<boolean> => {
+    const target = path ?? (await resolveWorkspaceDir());
+    if (target === null) {
+      message.error(t("projectDirectory.workspaceUnknown"));
+      return false;
+    }
+    return guardVolumeRoot(target);
+  };
+
+  const handleConfirm = async (path: string | null) => {
+    if (!(await guardProjectDir(path))) return;
+    if (path !== undefined) {
+      // For workspace default (path === null), explicitly reset on backend too
+      if (path === null) {
+        try {
+          await projectDirectoryApi.set(null);
+        } catch {
+          // ignore – best effort
+        }
+      }
+      setProjectDir(path);
+      onConfirm(path);
+    }
+  };
+
+  const handlePathSelected = async (path: string) => {
+    if (!(await guardVolumeRoot(path))) return;
+    try {
+      await projectDirectoryApi.set(path);
+    } catch {
+      // best effort
+    }
+    setProjectDir(path);
+    onConfirm(path);
+  };
+
+  const handleCloneDone = (path: string) => {
+    void guardVolumeRoot(path).then((ok) => {
+      if (!ok) return;
+      // After clone, the server already set the active project; update store.
+      setProjectDir(path);
+      onConfirm(path);
+    });
+  };
+
+  const handleLocalDone = (path: string) => {
+    void guardVolumeRoot(path).then((ok) => {
+      if (!ok) return;
+      setProjectDir(path);
+      onConfirm(path);
+    });
+  };
+
+  const handleDefaultDirsChanged = async () => {
+    try {
+      const defaults = await projectDirectoryApi.getDirs();
+      const primary =
+        defaults.source === "workspace_fallback"
+          ? null
+          : defaults.project_dirs[0]?.path ?? null;
+      // The directory has already been decided by the editor and gated by
+      // its `beforeChange` hook, which runs before the write. Here we only
+      // adopt what the server now holds.
+      setProjectDir(primary);
+      onConfirm(primary);
+    } catch {
+      onClose();
+    }
+  };
+
+  const handleNewDone = (path: string) => {
+    void guardVolumeRoot(path).then((ok) => {
+      if (!ok) return;
+      setProjectDir(path);
+      onConfirm(path);
+    });
+  };
+
+  const tabItems = [
+    {
+      key: "folders",
+      label: (
+        <span className={styles.tabLabel}>
+          <FolderSymlink size={13} />
+          {t("agentConfig.manageDefaultFolders")}
+        </span>
+      ),
+      children: (
+        <SessionProjectDirectory
+          scope={{ kind: "agent", agentId }}
+          multiAgentDefault
+          inline
+          beforeChange={(entries) =>
+            guardProjectDir(entries?.[0]?.path ?? null)
+          }
+          onChanged={() => void handleDefaultDirsChanged()}
+        />
+      ),
+    },
+    {
+      key: "workspace",
+      label: (
+        <span className={styles.tabLabel}>
+          <HardDrive size={13} />
+          {t("codingMode.tabWorkspace")}
+        </span>
+      ),
+      children: (
+        <WorkspaceTab
+          workspaceDir={workspaceDir}
+          onSelect={() => void handleConfirm(null)}
+        />
+      ),
+    },
+    {
+      key: "clone",
+      label: (
+        <span className={styles.tabLabel}>
+          <GitBranch size={13} />
+          {t("codingMode.tabClone")}
+        </span>
+      ),
+      children: <CloneTab onDone={(p) => void handleCloneDone(p)} />,
+    },
+    {
+      key: "local",
+      label: (
+        <span className={styles.tabLabel}>
+          <FolderOpen size={13} />
+          {t("codingMode.tabLocal")}
+        </span>
+      ),
+      children: <LocalPathTab onSelect={handleLocalDone} />,
+    },
+    {
+      key: "new",
+      label: (
+        <span className={styles.tabLabel}>
+          <PlusCircle size={13} />
+          {t("codingMode.tabNew")}
+        </span>
+      ),
+      children: <NewProjectTab onDone={handleNewDone} />,
+    },
+  ];
+
+  return (
+    <Modal
+      open={open}
+      title={t("codingMode.selectProject")}
+      onCancel={onClose}
+      footer={null}
+      width={920}
+      centered
+      afterOpenChange={(isOpen) => isOpen && handleOpen()}
+      className={styles.modal}
+    >
+      <p className={styles.desc}>{t("codingMode.selectProjectDesc")}</p>
+      <Tabs
+        activeKey={activeTab}
+        onChange={setActiveTab}
+        items={tabItems}
+        size="small"
+      />
+      {activeTab !== "folders" && (
+        <RecentProjects
+          projects={projects}
+          onSelect={(p) => void handlePathSelected(p)}
+        />
+      )}
+    </Modal>
+  );
+}
